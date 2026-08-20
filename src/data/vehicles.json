@@ -1,0 +1,50 @@
+[
+  {
+    "id": "1",
+    "code": "V.15203",
+    "model": "VW Gol Trend",
+    "status": "en_inspeccion",
+    "mechanic": "Joaquín Cabrera",
+    "image": "https://images.unsplash.com/photo-1511919884226-4f0f2c5d0645?auto=format&fit=crop&w=800&q=80",
+    "dominio": "ABC123",
+    "motorNumber": "9BWZZZ377VT004251",
+    "chassisNumber": "1HGCM82633A004352",
+    "bajaTag": "V.14322"
+  },
+  {
+    "id": "2",
+    "code": "V.15218",
+    "model": "Ford Ranger",
+    "status": "preparacion",
+    "mechanic": "Francisco Gutiérrez",
+    "image": "https://images.unsplash.com/photo-1503376780353-7e6692767b70?auto=format&fit=crop&w=800&q=80",
+    "dominio": "DEF456",
+    "motorNumber": "1FTFW1EF2EKE12345",
+    "chassisNumber": "2FTRX18L1XCA12345",
+    "bajaTag": "V.15218"
+  },
+  {
+    "id": "3",
+    "code": "V.15221",
+    "model": "Peugeot 208",
+    "status": "control_calidad",
+    "mechanic": "Krenz Jose Luis",
+    "image": "https://images.unsplash.com/photo-1549924231-f129b911e442?auto=format&fit=crop&w=800&q=80",
+    "dominio": "GHI789",
+    "motorNumber": "VF3HBHMR3GW123456",
+    "chassisNumber": "VF3HBHMR7GW654321",
+    "bajaTag": "V.15221"
+  },
+  {
+    "id": "4",
+    "code": "V.15212",
+    "model": "Renault Duster",
+    "status": "en_reparacion",
+    "mechanic": "Giordano Nahir",
+    "image": "https://images.unsplash.com/photo-1542367597-2b4669e8df86?auto=format&fit=crop&w=800&q=80",
+    "dominio": "JKL012",
+    "motorNumber": "9B1KK41R34A123456",
+    "chassisNumber": "9B1KK41R94A654321",
+    "bajaTag": "V.15212"
+  }
+]

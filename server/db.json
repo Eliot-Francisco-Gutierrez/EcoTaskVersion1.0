@@ -1,0 +1,50 @@
+{
+  "isAuthenticated": true,
+  "user": {
+    "id": "220",
+    "username": "Operario1",
+    "fullName": "Usuario test",
+    "email": "Operario1@internal.local",
+    "role": "Taller",
+    "category": "Operario",
+    "permissions": [
+      "tasks.read",
+      "tasks.complete",
+      "requests.read",
+      "requests.write",
+      "notifications.read"
+    ],
+    "avatar": "",
+    "active": true
+  },
+  "users": [
+    {
+      "id": "220",
+      "username": "Operario1",
+      "fullName": "Usuario test",
+      "email": "Operario1@internal.local",
+      "role": "Taller",
+      "category": "Operario",
+      "permissions": [
+        "tasks.read",
+        "tasks.complete",
+        "requests.read",
+        "requests.write",
+        "notifications.read"
+      ],
+      "avatar": "",
+      "active": true
+    }
+  ],
+  "vehicles": [],
+  "tasks": [],
+  "requests": [],
+  "historyRecords": [],
+  "archivedVehicles": [],
+  "notifications": [],
+  "systemSettings": {
+    "title": "EcoTask Autoparts",
+    "schedule": "08:00 - 18:00",
+    "dailyTarget": "20"
+  }
+}
