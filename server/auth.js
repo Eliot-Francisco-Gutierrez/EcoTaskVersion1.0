@@ -2,7 +2,12 @@ const jwt = require('jsonwebtoken')
 const bcrypt = require('bcryptjs')
 const { roles } = require('./rbac')
 
-const JWT_SECRET = process.env.JWT_SECRET || 'ecotask-internal-secret'
+const getJwtSecret = () => {
+  if (!process.env.JWT_SECRET) {
+    throw new Error('JWT_SECRET es obligatorio para autenticar usuarios')
+  }
+  return process.env.JWT_SECRET
+}
 
 const normalizeUser = (user) => ({
   id: user.id,
@@ -14,7 +19,7 @@ const normalizeUser = (user) => ({
   permissions: user.permissions || roles[user.role]?.permissions || [],
 })
 
-const createToken = (user) => jwt.sign({ userId: user.id ?? user.userId ?? null, role: user.role, permissions: user.permissions || [] }, JWT_SECRET, { expiresIn: '8h' })
+const createToken = (user) => jwt.sign({ userId: user.id ?? user.userId ?? null, role: user.role, permissions: user.permissions || [] }, getJwtSecret(), { expiresIn: '8h' })
 
 const hashPassword = async (plainPassword) => bcrypt.hash(plainPassword, 10)
 
@@ -22,7 +27,7 @@ const verifyPassword = async (plainPassword, hash) => bcrypt.compare(plainPasswo
 
 const verifyToken = (token) => {
   try {
-    return jwt.verify(token, JWT_SECRET)
+    return jwt.verify(token, getJwtSecret())
   } catch {
     return null
   }

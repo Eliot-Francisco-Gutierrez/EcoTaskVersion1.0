@@ -10,9 +10,10 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "firebase": "^12.18.0",
+    "firebase-admin": "^14.3.0",
     "jsonwebtoken": "^9.0.3",
     "lucide-react": "^0.464.0",
-    "mysql2": "^3.23.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
@@ -31,9 +32,10 @@
     "dev": "vite",
     "server": "node server/server.js",
     "start": "node server/server.js",
+    "db:seed": "node server/seedFirestore.js",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "firebase:deploy": "npm run build && npx firebase-tools deploy --only hosting",
+    "firebase:deploy": "npm run build && npx firebase-tools deploy --only hosting,firestore",
     "firebase:login": "npx firebase-tools login"
   }
 }

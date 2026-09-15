@@ -18,6 +18,7 @@ import { RequestsPanel } from './components/RequestsPanel'
 import { DailyMetricsPanel } from './components/DailyMetricsPanel'
 import { ActionModal, ActionField } from './components/ActionModal'
 import { User, Task, RequestItem, RecordItem, Vehicle, NotificationItem, DailyMetric, subprocessSteps, workflowSteps } from './data/mockData'
+import { firestoreApiFetch, logout as logoutFromFirebase } from './lib/firestoreApi'
 
 const normalizePermissionList = (permissions: string[] = []) => Array.from(new Set((permissions ?? []).map((permission) => String(permission).trim().toLowerCase()).filter(Boolean)))
 
@@ -38,7 +39,7 @@ const menuItems = [
 ]
 
 export default function App() {
-  const storageKey = 'ecotaskState'
+  const storageKey = 'ecotaskState-v2'
   const emptyUser: User = {
     id: '',
     username: '',
@@ -91,7 +92,7 @@ export default function App() {
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(savedState?.isAuthenticated ?? false)
   const [authToken, setAuthToken] = useState<string | null>(() => {
     if (typeof window === 'undefined') return null
-    return window.localStorage.getItem('ecotask-auth-token')
+    return window.localStorage.getItem('ecotask-auth-token-v2')
   })
   const [modalOpen, setModalOpen] = useState(false)
   const [modalConfig, setModalConfig] = useState<{
@@ -124,66 +125,17 @@ export default function App() {
   })
   const suppressNextBroadcastRef = useRef(false)
   const backendReadyRef = useRef(false)
-  const apiBaseUrl = (() => {
-    if (typeof window === 'undefined') return 'http://localhost:3001'
-
-    const { hostname } = window.location
-    const isLocalHost = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]'
-    const isLanHost = /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)/.test(hostname)
-
-    if (import.meta.env.DEV && isLocalHost) {
-      return 'http://localhost:3001'
-    }
-
-    if (import.meta.env.DEV && isLanHost) {
-      return `http://${hostname}:3001`
-    }
-
-    if (import.meta.env.VITE_API_URL) {
-      return import.meta.env.VITE_API_URL.replace(/\/$/, '')
-    }
-
-    return 'http://localhost:3001'
-  })()
-
   const apiFetch = async (path: string, method: string = 'GET', body?: Record<string, unknown>) => {
     if (!authToken || !isAuthenticated) {
       return null
     }
-
-    const response = await fetch(`${apiBaseUrl}${path}`, {
-      method,
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${authToken}`,
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    })
-
-    if (!response.ok) {
-      const errorBody = await response.json().catch(() => ({}))
-      throw new Error(errorBody?.error || 'Error en la operación')
-    }
-
-    const contentType = response.headers.get('content-type') || ''
-    if (contentType.includes('application/json')) {
-      return response.json()
-    }
-
-    return null
+    return firestoreApiFetch(path, method as 'GET' | 'POST' | 'PUT' | 'DELETE', body)
   }
 
   const persistStateToBackend = async (nextState: Partial<typeof getDefaultState> & { isAuthenticated?: boolean; user?: User; systemSettings?: typeof systemSettings }) => {
     if (!authToken || !isAuthenticated) return
     try {
-      await fetch(`${apiBaseUrl}/api/state`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${authToken}`,
-        },
-        body: JSON.stringify(nextState),
-      })
+      await firestoreApiFetch('/api/state', 'POST', nextState as Record<string, unknown>)
     } catch {
       // no-op: sync failures should not block the UI
     }
@@ -192,11 +144,7 @@ export default function App() {
   useEffect(() => {
     const hydrateFromApi = async () => {
       try {
-        const response = await fetch(`${apiBaseUrl}/api/state`, {
-          headers: authToken ? { Authorization: `Bearer ${authToken}` } : undefined,
-        })
-        if (!response.ok) throw new Error('backend unavailable')
-        const backendState = await response.json()
+        const backendState = await firestoreApiFetch('/api/state', 'GET')
         if (!backendState) return
 
         setUser(backendState.user ?? emptyUser)
@@ -380,6 +328,7 @@ export default function App() {
   }
 
   const handleLogout = () => {
+    void logoutFromFirebase()
     setIsAuthenticated(false)
     setUser(emptyUser)
     setUsers([])
@@ -391,7 +340,7 @@ export default function App() {
     setNotifications([])
     setAuthToken(null)
     window.localStorage.removeItem(storageKey)
-    window.localStorage.removeItem('ecotask-auth-token')
+    window.localStorage.removeItem('ecotask-auth-token-v2')
   }
 
   useEffect(() => {
@@ -412,7 +361,7 @@ export default function App() {
     try {
       window.localStorage.setItem(storageKey, JSON.stringify(state))
       if (authToken) {
-        window.localStorage.setItem('ecotask-auth-token', authToken)
+        window.localStorage.setItem('ecotask-auth-token-v2', authToken)
       }
       if (suppressNextBroadcastRef.current) {
         suppressNextBroadcastRef.current = false
@@ -426,14 +375,7 @@ export default function App() {
       // ignore storage write errors
     }
 
-    fetch(`${apiBaseUrl}/api/state`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
-      },
-      body: JSON.stringify(state),
-    }).catch(() => {
+    firestoreApiFetch('/api/state', 'POST', state as Record<string, unknown>).catch(() => {
       // backend not available at the moment; localStorage remains as fallback
     })
   }, [isAuthenticated, user, users, vehicles, tasks, requests, historyRecords, archivedVehicles, notifications, broadcast, systemSettings, authToken])
@@ -506,7 +448,7 @@ export default function App() {
   }
 
   const buildModalConfig = (rawAction: string, section: string, currentUser: User) => {
-    const action = rawAction.trim()
+    const action = rawAction.replace(/^Ejecutar\s+/i, '').trim()
 
     if (action.startsWith('Ver detalles de ')) {
       const target = action.replace(/^Ver detalles de\s+/i, '')
@@ -568,7 +510,7 @@ export default function App() {
           return {
             title: 'Alertas del taller',
             description: 'Revisa las últimas alertas de producción y servicio.',
-            content: '• 2 vehículos pendientes de inspección\n• 1 pedido de repuestos retrasado\n• 1 vehículo listo para despacho',
+            content: vehicles.length || requests.length ? `Vehículos pendientes: ${vehicles.filter((vehicle) => vehicle.status !== 'Finalizado').length}\nSolicitudes abiertas: ${requests.length}` : 'No hay alertas operativas.',
             fields: [],
             submitLabel: 'Cerrar',
           }
@@ -712,7 +654,7 @@ export default function App() {
           return {
             title: 'Solicitudes abiertas',
             description: 'Revisa las solicitudes actuales del taller.',
-            content: 'Lista activa:\n• Lavado solicitado para V.15221\n• Repuesto solicitado para V.15218\n• Armado solicitado para V.15203',
+            content: requests.length ? `Solicitudes activas: ${requests.length}` : 'No hay solicitudes activas.',
             fields: [],
             submitLabel: 'Cerrar',
           }
@@ -753,7 +695,7 @@ export default function App() {
           return {
             title: 'Inventario de repuestos',
             description: 'Consulta el stock disponible y la ubicación.',
-            content: 'Stock actual:\n• Amortiguadores: 8\n• Lámparas delanteras: 15\n• Filtros de aceite: 20',
+            content: 'No hay inventario cargado. Puedes registrar un pedido desde este módulo.',
             fields: [],
             submitLabel: 'Cerrar',
           }
@@ -813,7 +755,9 @@ export default function App() {
           return {
             title: 'Vehículos listos para lavado',
             description: 'Consulta las unidades que esperan limpieza.',
-            content: 'Listo para lavado:\n• V.15221\n• V.15218\n• V.15203',
+            content: vehicles.filter((vehicle) => vehicle.status === 'Lavado').length
+              ? `Vehículos listos para lavado: ${vehicles.filter((vehicle) => vehicle.status === 'Lavado').length}`
+              : 'No hay vehículos pendientes de lavado.',
             fields: [],
             submitLabel: 'Cerrar',
           }
@@ -835,7 +779,9 @@ export default function App() {
           return {
             title: 'Módulo de fotografía',
             description: 'Revisa las unidades listas para imagen y venta.',
-            content: 'Vehículos listos para foto:\n• V.15203\n• V.15218\n• V.15212',
+            content: vehicles.filter((vehicle) => vehicle.status === 'Fotografia').length
+              ? `Vehículos listos para fotografía: ${vehicles.filter((vehicle) => vehicle.status === 'Fotografia').length}`
+              : 'No hay vehículos pendientes de fotografía.',
             fields: [],
             submitLabel: 'Cerrar',
           }
@@ -914,7 +860,7 @@ export default function App() {
           return {
             title: 'Indicadores del taller',
             description: 'Revisa el rendimiento y metas actuales.',
-            content: 'Indicadores:\n• Vehículos pendientes: 24\n• En preparación: 8\n• Listos para lavado: 5',
+            content: `Vehículos pendientes: ${vehicles.filter((vehicle) => vehicle.status !== 'Finalizado').length}\nEn preparación: ${vehicles.filter((vehicle) => vehicle.status === 'Preparacion').length}\nListos para lavado: ${vehicles.filter((vehicle) => vehicle.status === 'Lavado').length}`,
             fields: [],
             submitLabel: 'Cerrar',
           }
@@ -1006,7 +952,7 @@ export default function App() {
           return {
             title: 'Equipo activo',
             description: 'Revisa a los usuarios registrados y sus roles.',
-            content: 'Usuarios activos:\n• Poloni Diego Sebastian\n• Gutierrez Eliot Francisco\n• Krenz Jose Luis\n• Giordano Nahir\n• Marques Facundo\n• Marques Fernando\n• Encargado Planta',
+            content: users.length ? `Usuarios activos: ${users.length}` : 'No hay usuarios registrados.',
             fields: [],
             submitLabel: 'Cerrar',
           }
@@ -1050,7 +996,7 @@ export default function App() {
     return {
       title: action,
       description: `Acción de ${section}`,
-      content: 'Esta acción abre un flujo de trabajo específico del módulo.',
+      content: 'Esta acción no tiene datos disponibles para operar todavía.',
       fields: [],
       submitLabel: 'Cerrar',
     }
@@ -2154,12 +2100,18 @@ export default function App() {
     URL.revokeObjectURL(url)
   }
 
-  const handleUpdatePermissions = (targetUserId: string, permissions: string[]) => {
+  const handleUpdatePermissions = async (targetUserId: string, permissions: string[]) => {
     if (!isAdmin) {
       setFeedbackMessage('Solo un administrador puede cambiar permisos del sistema.')
       return
     }
     const normalized = Array.from(new Set(permissions.map((permission) => permission.trim().toLowerCase()).filter(Boolean)))
+    try {
+      await apiFetch(`/api/users/${targetUserId}`, 'PUT', { permissions: normalized })
+    } catch (error) {
+      setFeedbackMessage(error instanceof Error ? error.message : 'No se pudieron guardar los permisos.')
+      return
+    }
     setUsers((current) => {
       const nextUsers = current.map((item) => (item.id === targetUserId ? { ...item, permissions: normalized } : item))
       if (user.id === targetUserId) {
@@ -2248,7 +2200,7 @@ export default function App() {
       })
       setAuthToken(payload.token)
       setIsAuthenticated(true)
-      window.localStorage.setItem('ecotask-auth-token', payload.token)
+      window.localStorage.setItem('ecotask-auth-token-v2', payload.token)
     }} />
   }
 

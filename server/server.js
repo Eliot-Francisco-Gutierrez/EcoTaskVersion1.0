@@ -3,23 +3,25 @@ const cors = require('cors')
 const fs = require('fs')
 const path = require('path')
 require('dotenv').config()
-const mysql = require('mysql2/promise')
 const bcrypt = require('bcryptjs')
-const { createToken, normalizeUser, verifyToken } = require('./auth')
+const { createToken, verifyToken } = require('./auth')
 const { roles, permissionCatalog } = require('./rbac')
+const repo = require('./firestoreRepo')
+
+// Evita que un error de credenciales de Firestore tumbe todo el proceso.
+process.on('unhandledRejection', (error) => {
+  console.error('Unhandled rejection (Firestore u otro servicio):', error?.message || error)
+})
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception (Firestore u otro servicio):', error?.message || error)
+})
 
 const app = express()
 const port = Number(process.env.PORT || 3001)
-const dbPath = path.join(__dirname, 'db.json')
-
-const defaultSeedUsers = []
-
-const defaultLoginCredentials = Object.fromEntries(defaultSeedUsers.map((user) => [user.username, user.password]))
 
 const emptyUser = {
   id: '',
   username: '',
-  password: '',
   fullName: '',
   role: 'Operario',
   category: 'Operario',
@@ -27,94 +29,7 @@ const emptyUser = {
   avatar: '',
 }
 
-const defaultState = {
-  isAuthenticated: false,
-  user: emptyUser,
-  users: [],
-  vehicles: [],
-  tasks: [],
-  requests: [],
-  historyRecords: [],
-  archivedVehicles: [],
-  notifications: [],
-  systemSettings: { title: 'EcoTask Autoparts', schedule: '08:00 - 18:00', dailyTarget: '20' },
-}
-
-const ensureDb = () => {
-  if (!fs.existsSync(dbPath)) {
-    fs.writeFileSync(dbPath, JSON.stringify(defaultState, null, 2))
-  }
-}
-
-const readDb = () => {
-  ensureDb()
-  try {
-    const raw = fs.readFileSync(dbPath, 'utf8')
-    return JSON.parse(raw)
-  } catch {
-    fs.writeFileSync(dbPath, JSON.stringify(defaultState, null, 2))
-    return JSON.parse(JSON.stringify(defaultState))
-  }
-}
-
-const writeDb = (state) => {
-  fs.writeFileSync(dbPath, JSON.stringify(state, null, 2))
-  return state
-}
-
-const dbPool = mysql.createPool({
-  host: process.env.DB_HOST || 'localhost',
-  port: Number(process.env.DB_PORT || 3306),
-  user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD || '',
-  database: process.env.DB_NAME || 'ecotask',
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
-})
-
-const ensureDefaultUsers = async () => {
-  try {
-    for (const user of defaultSeedUsers) {
-      const passwordHash = await bcrypt.hash(user.password, 10)
-      await dbPool.execute(
-        `INSERT INTO users (username, email, password_hash, full_name, role, department, active, avatar_url)
-         VALUES (?, ?, ?, ?, ?, ?, 1, NULL)
-         ON DUPLICATE KEY UPDATE
-           email = VALUES(email),
-           password_hash = VALUES(password_hash),
-           full_name = VALUES(full_name),
-           role = VALUES(role),
-           department = VALUES(department),
-           active = VALUES(active)`,
-        [user.username, `${user.username}@internal.local`, passwordHash, user.fullName, user.role, user.department],
-      )
-    }
-  } catch (error) {
-    console.warn('Default user sync failed:', error.message)
-  }
-}
-
-const removeLegacyBootstrapAdmin = async () => {
-  try {
-    await dbPool.execute(
-      'DELETE FROM users WHERE username = ? AND email = ? AND full_name = ? AND role = ?',
-      ['admin', 'admin@ecotask.local', 'Administrador', 'admin'],
-    )
-  } catch (error) {
-    console.warn('Legacy admin cleanup skipped:', error.message)
-  }
-}
-
-const getAdminCount = async () => {
-  try {
-    const [rows] = await dbPool.query("SELECT COUNT(*) AS total FROM users WHERE LOWER(role) = 'admin'")
-    return Number(rows?.[0]?.total || 0)
-  } catch {
-    const db = readDb()
-    return (db.users || []).filter((user) => String(user.role).toLowerCase() === 'admin').length
-  }
-}
+const defaultSystemSettings = { title: 'EcoTask Autoparts', schedule: '08:00 - 18:00', dailyTarget: '20' }
 
 const normalizeRoleKey = (role = 'operator') => {
   const normalized = String(role || 'operator')
@@ -144,32 +59,71 @@ const getRolePermissions = (role = 'operator') => {
   return roles[normalizedRole]?.permissions || roles.operator.permissions || []
 }
 
-const mapDbUser = (row) => ({
-  id: String(row.id),
-  username: row.username,
-  fullName: row.full_name || row.username,
-  email: row.email || '',
-  role: row.role || 'operator',
-  category: row.role === 'admin' ? 'Administrador' : row.role === 'encargado' ? 'Encargado' : row.role === 'supervisor' ? 'Referente' : 'Operario',
-  permissions: getRolePermissions(row.role),
-  avatar: row.avatar_url || '',
-  active: row.active !== 0,
+const toIso = (value) => {
+  if (!value) return new Date().toISOString()
+  if (typeof value.toDate === 'function') return value.toDate().toISOString()
+  return value
+}
+
+const mapUser = (doc) => ({
+  id: doc.id,
+  username: doc.username,
+  fullName: doc.fullName || doc.username,
+  email: doc.email || '',
+  role: doc.role || 'operator',
+  category: doc.role === 'admin' ? 'Administrador' : doc.role === 'encargado' ? 'Encargado' : doc.role === 'supervisor' ? 'Referente' : 'Operario',
+  permissions: getRolePermissions(doc.role),
+  avatar: doc.avatarUrl || '',
+  active: doc.active !== false,
 })
 
-const getSystemSettings = async () => {
-  try {
-    const [rows] = await dbPool.query('SELECT setting_key, setting_value FROM system_settings')
-    const settings = {}
-    for (const row of rows) settings[row.setting_key] = row.setting_value
-    return {
-      title: settings.app_title || 'EcoTask Autoparts',
-      schedule: settings.schedule || '08:00 - 18:00',
-      dailyTarget: settings.daily_target || '20',
-    }
-  } catch {
-    return defaultState.systemSettings
-  }
-}
+const mapVehicle = (doc) => ({
+  id: doc.id,
+  code: doc.code,
+  model: doc.model,
+  status: doc.status,
+  mechanic: doc.mechanic || 'Sin asignar',
+  image: doc.imageUrl || 'https://images.unsplash.com/photo-1503376780353-7e6692767b70?auto=format&fit=crop&w=800&q=80',
+  dominio: doc.domain || '',
+  motorNumber: doc.motorNumber || '',
+  chassisNumber: doc.chassisNumber || '',
+  bajaTag: doc.bajaTag || '',
+  owner: doc.ownerUserId ? String(doc.ownerUserId) : 'sistema',
+  photos: doc.photos || [],
+})
+
+const mapTask = (doc) => ({
+  id: doc.id,
+  title: doc.title,
+  priority: doc.priority || 'Media',
+  assignedTo: doc.assignedTo || 'Sin asignar',
+  dueDate: doc.dueDate || 'Sin fecha',
+  vehicle: doc.vehicle,
+})
+
+const mapRequest = (doc) => ({
+  id: doc.id,
+  title: doc.title,
+  description: doc.description || '',
+  timeAgo: 'Ahora',
+  badgeColor: 'bg-cyan-500/10 text-cyan-200',
+  requestType: doc.requestType || 'General',
+  requestedBy: doc.requestedBy || 'Sistema',
+  assignedTo: doc.assignedTo || 'Sin asignar',
+  vehicle: doc.vehicle,
+  status: doc.status,
+  createdAt: toIso(doc.createdAt),
+})
+
+const mapNotification = (doc) => ({
+  id: doc.id,
+  message: doc.message,
+  createdAt: toIso(doc.createdAt),
+  read: Boolean(doc.isRead),
+  fromUser: doc.fromUser || 'Sistema',
+  toUser: doc.toUser || 'all',
+  requestId: doc.requestId,
+})
 
 app.use(cors())
 app.use(express.json({ limit: '10mb' }))
@@ -211,12 +165,17 @@ const requirePermission = (permission) => (req, res, next) => {
 }
 
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, service: 'ecotask-backend', timestamp: new Date().toISOString() })
+  res.json({ ok: true, service: 'ecotask-backend', timestamp: new Date().toISOString(), db: 'firestore' })
 })
 
 app.get('/api/auth/bootstrap-status', async (_req, res) => {
-  const adminCount = await getAdminCount()
-  res.json({ canCreateAdmin: adminCount === 0, hasAdmin: adminCount > 0 })
+  try {
+    const adminCount = await repo.countAdmins()
+    res.json({ canCreateAdmin: adminCount === 0, hasAdmin: adminCount > 0 })
+  } catch (error) {
+    console.error('Bootstrap status error:', error)
+    res.status(500).json({ error: 'No se pudo consultar Firestore' })
+  }
 })
 
 app.post('/api/auth/bootstrap-admin', async (req, res) => {
@@ -225,55 +184,35 @@ app.post('/api/auth/bootstrap-admin', async (req, res) => {
     return res.status(400).json({ error: 'Usuario, nombre y contraseña requeridos' })
   }
 
-  const adminCount = await getAdminCount()
-  if (adminCount > 0) {
-    return res.status(409).json({ error: 'Ya existe un administrador creado' })
-  }
-
   try {
-    const passwordHash = await bcrypt.hash(password, 10)
-    const [result] = await dbPool.execute(
-      'INSERT INTO users (username, email, password_hash, full_name, role, department, active, avatar_url) VALUES (?, ?, ?, ?, ?, ?, 1, NULL)',
-      [username, `${username}@internal.local`, passwordHash, fullName, 'admin', 'General'],
-    )
-    const [rows] = await dbPool.execute('SELECT * FROM users WHERE id = ? LIMIT 1', [result.insertId])
-    const safeUser = mapDbUser(rows[0])
-    const state = readDb()
-    state.users = [safeUser, ...(state.users || []).filter((user) => String(user.id) !== String(safeUser.id))]
-    state.user = safeUser
-    state.isAuthenticated = true
-    writeDb(state)
-    const token = createToken({ userId: safeUser.id, role: safeUser.role, permissions: safeUser.permissions })
-    return res.status(201).json({ token, user: safeUser, permissions: safeUser.permissions })
-  } catch (error) {
-    const db = readDb()
-    const currentAdmin = (db.users || []).find((user) => String(user.role).toLowerCase() === 'admin')
-    if (currentAdmin) {
+    const adminCount = await repo.countAdmins()
+    if (adminCount > 0) {
       return res.status(409).json({ error: 'Ya existe un administrador creado' })
     }
 
-    const nextUser = {
-      id: `u${Date.now()}`,
+    const existing = await repo.findUserByUsername(username)
+    if (existing) {
+      return res.status(409).json({ error: 'El usuario ya existe' })
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10)
+    const created = await repo.createUser({
       username,
       email: `${username}@internal.local`,
-      password,
+      passwordHash,
       fullName,
       role: 'admin',
       department: 'General',
-      category: 'Administrador',
-      permissions: ['all'],
-      avatar: '',
       active: true,
-    }
+      avatarUrl: null,
+    })
 
-    db.users = [nextUser, ...(db.users || [])]
-    db.isAuthenticated = true
-    db.user = nextUser
-    writeDb(db)
-
-    const safeUser = normalizeUser(nextUser)
+    const safeUser = mapUser(created)
     const token = createToken({ userId: safeUser.id, role: safeUser.role, permissions: safeUser.permissions })
     return res.status(201).json({ token, user: safeUser, permissions: safeUser.permissions })
+  } catch (error) {
+    console.error('Bootstrap admin error:', error)
+    return res.status(500).json({ error: 'No se pudo crear el administrador' })
   }
 })
 
@@ -284,87 +223,80 @@ app.post('/api/auth/login', async (req, res) => {
   }
 
   try {
-    const [rows] = await dbPool.execute('SELECT * FROM users WHERE username = ? LIMIT 1', [username])
-    const foundUser = rows[0]
-
+    const foundUser = await repo.findUserByUsername(username)
     if (!foundUser) {
       return res.status(401).json({ error: 'Credenciales inválidas' })
     }
 
-    const isValid = await bcrypt.compare(password, foundUser.password_hash)
-    const isFallbackValid = defaultLoginCredentials[username] === password
-
-    if (!isValid && !isFallbackValid) {
+    const isValid = await bcrypt.compare(password, foundUser.passwordHash || '')
+    if (!isValid) {
       return res.status(401).json({ error: 'Credenciales inválidas' })
     }
 
-    if (isFallbackValid) {
-      const nextHash = await bcrypt.hash(password, 10)
-      await dbPool.execute('UPDATE users SET password_hash = ? WHERE username = ?', [nextHash, username])
-    }
-
-    const safeUser = mapDbUser(foundUser)
+    const safeUser = mapUser(foundUser)
     const token = createToken({ userId: safeUser.id, role: safeUser.role, permissions: safeUser.permissions })
 
-    return res.json({
-      token,
-      user: safeUser,
-      permissions: safeUser.permissions,
-    })
+    return res.json({ token, user: safeUser, permissions: safeUser.permissions })
   } catch (error) {
-    console.error('Login DB error:', error)
-    const db = readDb()
-    const fallbackUser = (db.users || []).find((user) => user.username === username)
-    if (!fallbackUser) return res.status(401).json({ error: 'Credenciales inválidas' })
-    const valid = fallbackUser.password === password || fallbackUser.passwordHash === password || defaultLoginCredentials[username] === password
-    if (!valid) return res.status(401).json({ error: 'Credenciales inválidas' })
-
-    const safeUser = normalizeUser(fallbackUser)
-    return res.json({ token: createToken(safeUser), user: safeUser, permissions: safeUser.permissions })
+    console.error('Login error:', error)
+    return res.status(500).json({ error: 'Error de autenticación' })
   }
 })
 
 app.get('/api/me', requireAuth, async (req, res) => {
   try {
-    const [rows] = await dbPool.execute('SELECT * FROM users WHERE id = ? LIMIT 1', [req.user.userId])
-    const user = rows[0]
-    if (!user) return res.status(404).json({ error: 'Usuario no encontrado' })
-    return res.json(mapDbUser(user))
+    const foundUser = await repo.getUserById(req.user.userId)
+    if (!foundUser) return res.status(404).json({ error: 'Usuario no encontrado' })
+    return res.json(mapUser(foundUser))
   } catch (error) {
-    const db = readDb()
-    const user = (db.users || []).find((item) => String(item.id) === String(req.user.userId)) || db.users[0]
-    return res.json(normalizeUser(user))
+    console.error('Me error:', error)
+    return res.status(500).json({ error: 'No se pudo obtener el usuario' })
   }
 })
 
 app.get('/api/state', requireAuth, async (req, res) => {
   try {
-    const state = readDb()
-    const requestedUserId = req.user?.userId ?? null
-    const rows = requestedUserId ? (await dbPool.execute('SELECT * FROM users WHERE id = ? LIMIT 1', [requestedUserId]))[0] : []
-    const currentUser = rows[0] ? mapDbUser(rows[0]) : (state.users || []).find((item) => requestedUserId && String(item.id) === String(requestedUserId)) || state.user || defaultState.user
-    const users = Array.isArray(state.users) ? state.users : []
-    const nextUsers = currentUser?.id
-      ? [currentUser, ...users.filter((item) => String(item.id) !== String(currentUser.id))]
-      : users
+    const [usersDocs, vehiclesDocs, tasksDocs, requestsDocs, notificationsDocs, settings] = await Promise.all([
+      repo.listUsers(),
+      repo.listVehicles(),
+      repo.listTasks(),
+      repo.listRequests(),
+      repo.listNotifications(),
+      repo.getSystemSettings(),
+    ])
+
+    const users = usersDocs.map(mapUser)
+    const currentUser = users.find((item) => String(item.id) === String(req.user.userId)) || users[0] || emptyUser
 
     res.json({
-      ...defaultState,
-      ...state,
       isAuthenticated: true,
       user: currentUser,
-      users: nextUsers,
+      users,
+      vehicles: vehiclesDocs.map(mapVehicle),
+      tasks: tasksDocs.map(mapTask),
+      requests: requestsDocs.map(mapRequest),
+      historyRecords: [],
+      archivedVehicles: [],
+      notifications: notificationsDocs.map(mapNotification),
+      systemSettings: settings || defaultSystemSettings,
       permissions: currentUser.permissions || [],
     })
   } catch (error) {
-    console.error('State DB error:', error)
-    const fallback = readDb()
-    res.json({
-      ...fallback,
-      isAuthenticated: true,
-      user: fallback.user || defaultState.user,
-      permissions: (fallback.user && fallback.user.permissions) || defaultState.user.permissions || [],
-    })
+    console.error('State error:', error)
+    res.status(500).json({ error: 'No se pudo leer el estado desde Firestore' })
+  }
+})
+
+app.post('/api/state', requireAuth, requirePermission('settings.write'), async (req, res) => {
+  const incoming = req.body || {}
+  try {
+    if (incoming.systemSettings) {
+      await repo.setSystemSettings(incoming.systemSettings)
+    }
+    res.status(200).json({ ok: true })
+  } catch (error) {
+    console.error('State sync error:', error)
+    res.status(500).json({ error: 'No se pudo sincronizar la configuración' })
   }
 })
 
@@ -376,141 +308,179 @@ app.get('/api/permissions', requireAuth, requirePermission('users.read'), (_req,
   res.json(permissionCatalog)
 })
 
-app.get('/api/tasks', requireAuth, requirePermission('tasks.read'), (_req, res) => {
-  const db = readDb()
-  res.json(db.tasks || [])
-})
-
-app.post('/api/tasks', requireAuth, requirePermission('tasks.write'), (req, res) => {
-  const db = readDb()
-  const task = {
-    id: `t${Date.now()}`,
-    title: req.body.title,
-    priority: req.body.priority || 'Media',
-    assignedTo: req.body.assignedTo || req.user.userId,
-    dueDate: req.body.dueDate || 'Sin fecha',
-    vehicle: req.body.vehicle,
-    createdAt: new Date().toISOString(),
+app.get('/api/tasks', requireAuth, requirePermission('tasks.read'), async (_req, res) => {
+  try {
+    const tasks = await repo.listTasks()
+    res.json(tasks.map(mapTask))
+  } catch (error) {
+    console.error('List tasks error:', error)
+    res.status(500).json({ error: 'No se pudieron leer las tareas' })
   }
-
-  db.tasks = [task, ...(db.tasks || [])]
-  writeDb(db)
-  res.status(201).json(task)
 })
 
-app.get('/api/requests', requireAuth, requirePermission('requests.read'), (_req, res) => {
-  const db = readDb()
-  res.json(db.requests || [])
-})
-
-app.post('/api/requests', requireAuth, requirePermission('requests.write'), (req, res) => {
-  const db = readDb()
-  const request = {
-    id: `r${Date.now()}`,
-    title: req.body.title,
-    description: req.body.description || '',
-    requestType: req.body.requestType || 'General',
-    requestedBy: req.body.requestedBy || 'Sistema',
-    assignedTo: req.body.assignedTo || 'Sin asignar',
-    vehicle: req.body.vehicle,
-    createdAt: new Date().toISOString(),
+app.post('/api/tasks', requireAuth, requirePermission('tasks.write'), async (req, res) => {
+  const { title, priority, assignedTo, dueDate, vehicle } = req.body || {}
+  if (!title) {
+    return res.status(400).json({ error: 'Título requerido' })
   }
-
-  db.requests = [request, ...(db.requests || [])]
-  writeDb(db)
-  res.status(201).json(request)
-})
-
-app.get('/api/notifications', requireAuth, requirePermission('notifications.read'), (_req, res) => {
-  const db = readDb()
-  res.json(db.notifications || [])
-})
-
-app.post('/api/notifications', requireAuth, requirePermission('notifications.write'), (req, res) => {
-  const db = readDb()
-  const notification = {
-    id: `n${Date.now()}`,
-    message: req.body.message || 'Nuevo aviso',
-    createdAt: new Date().toISOString(),
-    read: false,
-    fromUser: req.user.userId,
-    toUser: req.body.toUser || 'all',
+  try {
+    const created = await repo.createTask({
+      title,
+      priority: priority || 'Media',
+      assignedTo: assignedTo || req.user.userId,
+      dueDate: dueDate || 'Sin fecha',
+      vehicle,
+      status: 'pending',
+    })
+    res.status(201).json(mapTask(created))
+  } catch (error) {
+    console.error('Create task error:', error)
+    res.status(500).json({ error: 'No se pudo crear la tarea' })
   }
+})
 
-  db.notifications = [notification, ...(db.notifications || [])]
-  writeDb(db)
-  res.status(201).json(notification)
+app.put('/api/tasks/:id/complete', requireAuth, requirePermission('tasks.complete'), async (req, res) => {
+  try {
+    await repo.updateTask(req.params.id, { status: 'completed' })
+    res.json({ ok: true })
+  } catch (error) {
+    console.error('Complete task error:', error)
+    res.status(500).json({ error: 'No se pudo completar la tarea' })
+  }
+})
+
+app.get('/api/requests', requireAuth, requirePermission('requests.read'), async (_req, res) => {
+  try {
+    const requests = await repo.listRequests()
+    res.json(requests.map(mapRequest))
+  } catch (error) {
+    console.error('List requests error:', error)
+    res.status(500).json({ error: 'No se pudieron leer las solicitudes' })
+  }
+})
+
+app.post('/api/requests', requireAuth, requirePermission('requests.write'), async (req, res) => {
+  const { title, description, requestType, assignedTo, vehicle } = req.body || {}
+  if (!title) {
+    return res.status(400).json({ error: 'Título requerido' })
+  }
+  try {
+    const created = await repo.createRequest({
+      title,
+      description: description || '',
+      requestType: requestType || 'General',
+      requestedBy: req.user.userId,
+      assignedTo: assignedTo || 'Sin asignar',
+      vehicle,
+      status: 'open',
+    })
+    res.status(201).json(mapRequest(created))
+  } catch (error) {
+    console.error('Create request error:', error)
+    res.status(500).json({ error: 'No se pudo crear la solicitud' })
+  }
+})
+
+app.put('/api/requests/:id/complete', requireAuth, requirePermission('requests.write'), async (req, res) => {
+  try {
+    await repo.updateRequest(req.params.id, { status: 'closed' })
+    res.json({ ok: true })
+  } catch (error) {
+    console.error('Complete request error:', error)
+    res.status(500).json({ error: 'No se pudo completar la solicitud' })
+  }
+})
+
+app.get('/api/notifications', requireAuth, requirePermission('notifications.read'), async (_req, res) => {
+  try {
+    const notifications = await repo.listNotifications()
+    res.json(notifications.map(mapNotification))
+  } catch (error) {
+    console.error('List notifications error:', error)
+    res.status(500).json({ error: 'No se pudieron leer las notificaciones' })
+  }
+})
+
+app.post('/api/notifications', requireAuth, requirePermission('notifications.write'), async (req, res) => {
+  const { message, toUser, requestId } = req.body || {}
+  try {
+    const created = await repo.createNotification({
+      message: message || 'Nuevo aviso',
+      fromUser: req.user.userId,
+      toUser: toUser || 'all',
+      requestId: requestId || null,
+      isRead: false,
+    })
+    res.status(201).json(mapNotification(created))
+  } catch (error) {
+    console.error('Create notification error:', error)
+    res.status(500).json({ error: 'No se pudo crear la notificación' })
+  }
+})
+
+app.put('/api/notifications/:id/read', requireAuth, requirePermission('notifications.write'), async (req, res) => {
+  try {
+    await repo.markNotificationRead(req.params.id)
+    res.json({ ok: true })
+  } catch (error) {
+    console.error('Mark notification read error:', error)
+    res.status(500).json({ error: 'No se pudo actualizar la notificación' })
+  }
 })
 
 app.get('/api/audit', requireAuth, requirePermission('audit.read'), (_req, res) => {
-  const db = readDb()
-  res.json(db.historyRecords || [])
+  res.json([])
 })
 
 app.get('/api/users', requireAuth, requirePermission('users.read'), async (_req, res) => {
   try {
-    const [rows] = await dbPool.query('SELECT * FROM users ORDER BY id ASC')
-    res.json(rows.map(mapDbUser))
+    const users = await repo.listUsers()
+    res.json(users.map(mapUser))
   } catch (error) {
-    const db = readDb()
-    res.json((db.users || []).map((user) => normalizeUser(user)))
+    console.error('List users error:', error)
+    res.status(500).json({ error: 'No se pudieron leer los usuarios' })
   }
 })
 
 app.post('/api/users', requireAuth, requirePermission('users.write'), async (req, res) => {
-  const { username, fullName, role, category, permissions, password } = req.body || {}
+  const { username, fullName, role, password } = req.body || {}
   if (!username || !fullName) {
     return res.status(400).json({ error: 'Usuario y nombre requeridos' })
   }
 
   try {
-    const passwordHash = password ? await bcrypt.hash(password, 10) : await bcrypt.hash('changeme123', 10)
-    const [result] = await dbPool.execute(
-      'INSERT INTO users (username, email, password_hash, full_name, role, department, active, avatar_url) VALUES (?, ?, ?, ?, ?, ?, 1, NULL)',
-      [username, `${username}@internal.local`, passwordHash, fullName, role || 'operator', category || 'General'],
-    )
-
-    const userId = result.insertId
-    const createdUser = await dbPool.execute('SELECT * FROM users WHERE id = ? LIMIT 1', [userId])
-    const [row] = createdUser[0]
-    const normalizedUser = mapDbUser(row)
-    const db = readDb()
-    db.users = [normalizedUser, ...(db.users || []).filter((item) => String(item.id) !== String(normalizedUser.id))]
-    writeDb(db)
-    res.status(201).json(normalizedUser)
-  } catch (error) {
-    const db = readDb()
-    const item = {
-      id: `u${Date.now()}`,
-      username,
-      password: password || 'changeme123',
-      fullName,
-      role: role || category || 'Operario',
-      category: category || 'Operario',
-      permissions: Array.isArray(permissions) ? permissions : [],
+    const existing = await repo.findUserByUsername(username)
+    if (existing) {
+      return res.status(409).json({ error: 'El usuario ya existe' })
     }
-    db.users = [item, ...(db.users || [])]
-    writeDb(db)
-    res.status(201).json(normalizeUser(item))
+
+    const passwordHash = await bcrypt.hash(password || 'changeme123', 10)
+    const created = await repo.createUser({
+      username,
+      email: `${username}@internal.local`,
+      passwordHash,
+      fullName,
+      role: role || 'operator',
+      department: 'General',
+      active: true,
+      avatarUrl: null,
+    })
+
+    res.status(201).json(mapUser(created))
+  } catch (error) {
+    console.error('Create user error:', error)
+    res.status(500).json({ error: 'No se pudo crear el usuario' })
   }
 })
 
 app.delete('/api/users/:id', requireAuth, requirePermission('users.write'), async (req, res) => {
   try {
-    await dbPool.execute('DELETE FROM users WHERE id = ?', [req.params.id])
+    await repo.deleteUser(req.params.id)
+    res.json({ ok: true })
   } catch (error) {
-    console.warn('User DB delete failed:', error.message)
+    console.error('Delete user error:', error)
+    res.status(500).json({ error: 'No se pudo eliminar el usuario' })
   }
-
-  const db = readDb()
-  const nextUsers = (db.users || []).filter((item) => String(item.id) !== String(req.params.id))
-  db.users = nextUsers
-  if (db.user && String(db.user.id) === String(req.params.id)) {
-    db.user = emptyUser
-    db.isAuthenticated = false
-  }
-  writeDb(db)
-  res.json({ ok: true })
 })
 
 app.post('/api/vehicles', requireAuth, requirePermission('tasks.write'), async (req, res) => {
@@ -520,177 +490,39 @@ app.post('/api/vehicles', requireAuth, requirePermission('tasks.write'), async (
   }
 
   try {
-    const [result] = await dbPool.execute(
-      'INSERT INTO vehicles (code, model, status, domain, motor_number, chassis_number, baja_tag, owner_user_id, assigned_mechanic_id, image_url) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [code, model || 'Sin modelo', status || 'Ingresado', dominio, motorNumber || '', chassisNumber || '', bajaTag || '', req.user.userId || 1, req.user.userId || 1, image || 'https://images.unsplash.com/photo-1503376780353-7e6692767b70?auto=format&fit=crop&w=800&q=80'],
-    )
-    const [rows] = await dbPool.execute('SELECT * FROM vehicles WHERE id = ? LIMIT 1', [result.insertId])
-    res.status(201).json(rows[0])
-  } catch (error) {
-    const db = readDb()
-    const item = {
-      id: `v${Date.now()}`,
+    const created = await repo.createVehicle({
       code,
       model: model || 'Sin modelo',
       status: status || 'Ingresado',
       mechanic: mechanic || 'Sin asignar',
-      image: image || 'https://images.unsplash.com/photo-1503376780353-7e6692767b70?auto=format&fit=crop&w=800&q=80',
-      dominio,
+      domain: dominio,
       motorNumber: motorNumber || '',
       chassisNumber: chassisNumber || '',
       bajaTag: bajaTag || '',
-      owner: req.user.userId || 'admin',
+      ownerUserId: req.user.userId,
+      assignedMechanicId: req.user.userId,
+      imageUrl: image || null,
       photos: [],
-    }
-    db.vehicles = [item, ...(db.vehicles || [])]
-    writeDb(db)
-    res.status(201).json(item)
+    })
+    res.status(201).json(mapVehicle(created))
+  } catch (error) {
+    console.error('Create vehicle error:', error)
+    res.status(500).json({ error: 'No se pudo crear el vehículo' })
   }
 })
 
 app.put('/api/vehicles/:id/status', requireAuth, requirePermission('tasks.write'), async (req, res) => {
-  const { status, mechanic, notes } = req.body || {}
+  const { status, mechanic } = req.body || {}
   try {
-    if (status) {
-      await dbPool.execute('UPDATE vehicles SET status = ?, assigned_mechanic_id = ? WHERE id = ?', [status, req.user.userId || 1, req.params.id])
-    }
-    res.json({ ok: true, status, mechanic, notes })
+    const patch = {}
+    if (status) patch.status = status
+    if (mechanic) patch.mechanic = mechanic
+    await repo.updateVehicle(req.params.id, patch)
+    res.json({ ok: true, status, mechanic })
   } catch (error) {
-    const db = readDb()
-    db.vehicles = (db.vehicles || []).map((vehicle) => vehicle.id === req.params.id ? { ...vehicle, status: status || vehicle.status, mechanic: mechanic || vehicle.mechanic } : vehicle)
-    writeDb(db)
-    res.json({ ok: true })
+    console.error('Update vehicle error:', error)
+    res.status(500).json({ error: 'No se pudo actualizar el vehículo' })
   }
-})
-
-app.post('/api/tasks', requireAuth, requirePermission('tasks.write'), async (req, res) => {
-  const { title, priority, assignedTo, dueDate, vehicle } = req.body || {}
-  if (!title) {
-    return res.status(400).json({ error: 'Título requerido' })
-  }
-
-  try {
-    const [result] = await dbPool.execute(
-      'INSERT INTO tasks (title, description, vehicle_id, assigned_to, created_by, status, priority, due_date, department) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-      [title, '', vehicle ? Number(vehicle) || null : null, assignedTo || req.user.userId || 1, req.user.userId || 1, 'pending', priority || 'medium', dueDate || new Date(), 'General'],
-    )
-    const [rows] = await dbPool.execute('SELECT * FROM tasks WHERE id = ? LIMIT 1', [result.insertId])
-    res.status(201).json(rows[0])
-  } catch (error) {
-    const db = readDb()
-    const item = { id: `t${Date.now()}`, title, priority: priority || 'Media', assignedTo: assignedTo || req.user.userId || 'Sin asignar', dueDate: dueDate || 'Próximamente', vehicle }
-    db.tasks = [item, ...(db.tasks || [])]
-    writeDb(db)
-    res.status(201).json(item)
-  }
-})
-
-app.put('/api/tasks/:id/complete', requireAuth, requirePermission('tasks.complete'), async (req, res) => {
-  try {
-    await dbPool.execute('UPDATE tasks SET status = ? WHERE id = ?', ['completed', req.params.id])
-    res.json({ ok: true })
-  } catch (error) {
-    const db = readDb()
-    db.tasks = (db.tasks || []).filter((task) => task.id !== req.params.id)
-    writeDb(db)
-    res.json({ ok: true })
-  }
-})
-
-app.post('/api/requests', requireAuth, requirePermission('requests.write'), async (req, res) => {
-  const { title, description, requestType, assignedTo, vehicle } = req.body || {}
-  if (!title) {
-    return res.status(400).json({ error: 'Título requerido' })
-  }
-
-  try {
-    const [result] = await dbPool.execute(
-      'INSERT INTO requests (type, title, description, vehicle_id, requested_by, assigned_to, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [requestType || 'General', title, description || '', vehicle ? Number(vehicle) || null : null, req.user.userId || 1, assignedTo || req.user.userId || 1, 'open'],
-    )
-    const [rows] = await dbPool.execute('SELECT * FROM requests WHERE id = ? LIMIT 1', [result.insertId])
-    res.status(201).json(rows[0])
-  } catch (error) {
-    const db = readDb()
-    const item = { id: `r${Date.now()}`, title, description: description || '', requestType: requestType || 'General', requestedBy: req.user.userId || 'Sistema', assignedTo: assignedTo || 'Sin asignar', vehicle, createdAt: new Date().toISOString() }
-    db.requests = [item, ...(db.requests || [])]
-    writeDb(db)
-    res.status(201).json(item)
-  }
-})
-
-app.put('/api/requests/:id/complete', requireAuth, requirePermission('requests.write'), async (req, res) => {
-  try {
-    await dbPool.execute('UPDATE requests SET status = ? WHERE id = ?', ['closed', req.params.id])
-    res.json({ ok: true })
-  } catch (error) {
-    const db = readDb()
-    db.requests = (db.requests || []).filter((request) => request.id !== req.params.id)
-    writeDb(db)
-    res.json({ ok: true })
-  }
-})
-
-app.get('/api/notifications', requireAuth, requirePermission('notifications.read'), async (_req, res) => {
-  try {
-    const [rows] = await dbPool.query('SELECT * FROM notifications ORDER BY id DESC')
-    res.json(rows)
-  } catch (error) {
-    const db = readDb()
-    res.json(db.notifications || [])
-  }
-})
-
-app.post('/api/notifications', requireAuth, requirePermission('notifications.write'), async (req, res) => {
-  const { message, toUser, requestId } = req.body || {}
-  try {
-    const [result] = await dbPool.execute(
-      'INSERT INTO notifications (user_id, from_user_id, request_id, message, is_read) VALUES (?, ?, ?, ?, 0)',
-      [req.user.userId || 1, req.user.userId || 1, requestId || null, message || 'Nuevo aviso'],
-    )
-    const [rows] = await dbPool.execute('SELECT * FROM notifications WHERE id = ? LIMIT 1', [result.insertId])
-    res.status(201).json(rows[0])
-  } catch (error) {
-    const db = readDb()
-    const item = { id: `n${Date.now()}`, message: message || 'Nuevo aviso', createdAt: new Date().toISOString(), read: false, fromUser: req.user.userId || 'Sistema', toUser: toUser || 'all', requestId }
-    db.notifications = [item, ...(db.notifications || [])]
-    writeDb(db)
-    res.status(201).json(item)
-  }
-})
-
-app.put('/api/notifications/:id/read', requireAuth, requirePermission('notifications.write'), async (req, res) => {
-  try {
-    await dbPool.execute('UPDATE notifications SET is_read = 1 WHERE id = ?', [req.params.id])
-    res.json({ ok: true })
-  } catch (error) {
-    const db = readDb()
-    db.notifications = (db.notifications || []).map((notification) => notification.id === req.params.id ? { ...notification, read: true } : notification)
-    writeDb(db)
-    res.json({ ok: true })
-  }
-})
-
-app.post('/api/state', requireAuth, (req, res) => {
-  const incoming = req.body || {}
-  const current = readDb()
-  const merged = {
-    ...defaultState,
-    ...current,
-    ...incoming,
-    user: incoming.user || current.user || defaultState.user,
-    users: Array.isArray(incoming.users) ? incoming.users : current.users || defaultState.users,
-    vehicles: Array.isArray(incoming.vehicles) ? incoming.vehicles : current.vehicles || defaultState.vehicles,
-    tasks: Array.isArray(incoming.tasks) ? incoming.tasks : current.tasks || defaultState.tasks,
-    requests: Array.isArray(incoming.requests) ? incoming.requests : current.requests || defaultState.requests,
-    historyRecords: Array.isArray(incoming.historyRecords) ? incoming.historyRecords : current.historyRecords || defaultState.historyRecords,
-    archivedVehicles: Array.isArray(incoming.archivedVehicles) ? incoming.archivedVehicles : current.archivedVehicles || defaultState.archivedVehicles,
-    notifications: Array.isArray(incoming.notifications) ? incoming.notifications : current.notifications || defaultState.notifications,
-    systemSettings: incoming.systemSettings || current.systemSettings || defaultState.systemSettings,
-  }
-
-  const stored = writeDb(merged)
-  res.status(200).json(stored)
 })
 
 app.use((req, res, next) => {
@@ -702,7 +534,10 @@ app.use((req, res, next) => {
   return res.status(404).json({ error: 'Frontend build not found' })
 })
 
-app.listen(port, async () => {
-  await removeLegacyBootstrapAdmin()
-  console.log(`EcoTask backend running on http://localhost:${port}`)
-})
+if (require.main === module) {
+  app.listen(port, () => {
+    console.log(`EcoTask backend running on http://localhost:${port} (Firestore)`)
+  })
+}
+
+module.exports = app

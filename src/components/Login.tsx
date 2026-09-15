@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { ShieldPlus, UserCircle2, UserPlus } from 'lucide-react'
 import { User } from '../data/mockData'
+import { bootstrapAdmin, getBootstrapStatus, loginWithUsername } from '../lib/firestoreApi'
 
 interface LoginProps {
   users: User[]
@@ -20,28 +21,6 @@ export function Login({ users, onLogin }: LoginProps) {
   const [adminUsername, setAdminUsername] = useState('superadmin')
   const [adminPassword, setAdminPassword] = useState('')
 
-  const apiBaseUrl = (() => {
-    if (typeof window === 'undefined') return 'http://localhost:3001'
-
-    const { hostname } = window.location
-    const isLocalHost = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]'
-    const isLanHost = /^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[0-1])\.)/.test(hostname)
-
-    if (import.meta.env.DEV && isLocalHost) {
-      return 'http://localhost:3001'
-    }
-
-    if (import.meta.env.DEV && isLanHost) {
-      return `http://${hostname}:3001`
-    }
-
-    if (import.meta.env.VITE_API_URL) {
-      return import.meta.env.VITE_API_URL.replace(/\/$/, '')
-    }
-
-    return 'http://localhost:3001'
-  })()
-
   const hasAdminInProps = useMemo(
     () => users.some((user) => String(user.role).toLowerCase() === 'admin' || user.category === 'Administrador'),
     [users],
@@ -52,9 +31,7 @@ export function Login({ users, onLogin }: LoginProps) {
 
     const loadBootstrapStatus = async () => {
       try {
-        const response = await fetch(`${apiBaseUrl}/api/auth/bootstrap-status`)
-        if (!response.ok) throw new Error('bootstrap status unavailable')
-        const data = await response.json()
+        const data = await getBootstrapStatus()
         if (!cancelled) {
           setCanCreateAdmin(Boolean(data?.canCreateAdmin))
           setBootstrapLoading(false)
@@ -72,26 +49,15 @@ export function Login({ users, onLogin }: LoginProps) {
     return () => {
       cancelled = true
     }
-  }, [apiBaseUrl, hasAdminInProps])
+  }, [hasAdminInProps])
 
   const handleLogin = async () => {
     setIsSubmitting(true)
     setError('')
 
     try {
-      const response = await fetch(`${apiBaseUrl}/api/auth/login`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password }),
-      })
-
-      if (!response.ok) {
-        throw new Error('Credenciales inválidas')
-      }
-
-      const data = await response.json()
-      const matchedUser = users.find((item) => item.username === username) ?? { ...data.user, password: password }
-      onLogin({ user: { ...matchedUser, permissions: data.permissions || matchedUser.permissions || [] }, token: data.token })
+      const data = await loginWithUsername(username, password)
+      onLogin(data)
     } catch {
       setError('Usuario o contraseña incorrectos')
     } finally {
@@ -104,27 +70,8 @@ export function Login({ users, onLogin }: LoginProps) {
     setBootstrapError('')
 
     try {
-      const response = await fetch(`${apiBaseUrl}/api/auth/bootstrap-admin`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          username: adminUsername,
-          fullName: adminFullName,
-          password: adminPassword,
-        }),
-      })
-
-      if (!response.ok) {
-        const errorBody = await response.json().catch(() => ({}))
-        throw new Error(errorBody?.error || 'No se pudo crear el administrador')
-      }
-
-      const data = await response.json()
-      const matchedUser = users.find((item) => item.username === data.user?.username) ?? {
-        ...data.user,
-        password: adminPassword,
-      }
-      onLogin({ user: { ...matchedUser, permissions: data.permissions || matchedUser.permissions || ['all'] }, token: data.token })
+      const data = await bootstrapAdmin(adminUsername, adminFullName, adminPassword)
+      onLogin(data)
     } catch (loginError) {
       setBootstrapError(loginError instanceof Error ? loginError.message : 'No se pudo crear el administrador')
     } finally {
